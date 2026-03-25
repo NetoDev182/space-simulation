@@ -47,6 +47,7 @@ const geometry = new THREE.BufferGeometry();
 const positions = new Float32Array(PARTICLE_COUNT * 3);
 const velocities = new Float32Array(PARTICLE_COUNT * 3);
 const colors = new Float32Array(PARTICLE_COUNT * 3);
+const statusArray = new Float32Array(PARTICLE_COUNT); // 1.0 = alive, 0.0 = erased
 
 // The Sun
 const sunPos = new THREE.Vector3(0, 0, 0);
@@ -59,11 +60,11 @@ function initParticles() {
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
         const i3 = i * 3;
+        statusArray[i] = 1.0; // Reset as alive
         
         // Distribute particles in a flat disk
         const radius = 100 + Math.pow(Math.random(), 1.5) * 1800;
         const theta = Math.random() * Math.PI * 2;
-        // Natural distribution (thinner edge, thicker center)
         const thickness = Math.max(0.1, 1 - (radius / 2000)) * 60;
         const y = (Math.random() - 0.5) * thickness;
         
@@ -81,7 +82,7 @@ function initParticles() {
         const vz = Math.cos(theta) * vOrbital;
         
         velocities[i3] = vx;
-        velocities[i3+1] = 0; // Flat initially
+        velocities[i3+1] = 0;
         velocities[i3+2] = vz;
 
         // Color based on distance
@@ -94,7 +95,6 @@ function initParticles() {
             particleColor.set(0xffffff).lerp(new THREE.Color(0xaabbff), Math.random());
         }
         
-        // Random intensity
         const intensity = 0.5 + Math.random() * 0.5;
         colors[i3] = particleColor.r * intensity;
         colors[i3+1] = particleColor.g * intensity;
@@ -103,7 +103,9 @@ function initParticles() {
 
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('particleStatus', new THREE.BufferAttribute(statusArray, 1));
     geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.particleStatus.needsUpdate = true;
 }
 
 initParticles();
@@ -116,12 +118,12 @@ const particleUniforms = {
 };
 
 const vertexShader = `
+    attribute float particleStatus;
     uniform vec3 uBlackHolePos;
     uniform float uBhMass;
     varying vec3 vColor;
 
     void main() {
-        // Base color from buffer
         vColor = color;
         
         // Calculate distance to black hole
@@ -130,17 +132,16 @@ const vertexShader = `
         // Dynamic event horizon based on mass
         float horizon = 25.0 + (uBhMass / 25000.0) * 30.0;
         
-        // The closer to the horizon, the more light is swallowed (color becomes 0)
+        // Redshift and fading
         float lightEscape = smoothstep(horizon * 0.5, horizon * 4.0, dist);
-        
-        // Redshift effect: light stretches and shifts to dark red/black
-        vColor = mix(vec3(0.1, 0.0, 0.0), vColor, vec3(lightEscape));
-        vColor *= lightEscape; // darken fully when inside
+        vColor = mix(vec3(0.05, 0.0, 0.0), vColor, vec3(lightEscape));
+        vColor *= lightEscape;
         
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
         
-        // Particles shrink as they are swallowed
-        gl_PointSize = 2.5 * (300.0 / -mvPosition.z) * mix(0.1, 1.0, lightEscape);
+        // Points disappear if 'erased' or deeply swallowed
+        float visibility = particleStatus * mix(0.0, 1.0, lightEscape);
+        gl_PointSize = 2.5 * visibility * (300.0 / -mvPosition.z);
         gl_Position = projectionMatrix * mvPosition;
     }
 `;
@@ -266,10 +267,13 @@ function animate() {
     particleUniforms.uBhMass.value = currentBhMass;
     particleUniforms.uTime.value = time;
     
-    // Physics CPU Loop (O(N) against 2 massive bodies)
+    // Physics CPU Loop
+    const statuses = geometry.attributes.particleStatus.array;
+    
     for (let i = 0; i < PARTICLE_COUNT; i++) {
+        if (statuses[i] === 0.0) continue; // It's erased
+
         const i3 = i * 3;
-        
         const px = posArray[i3];
         const py = posArray[i3+1];
         const pz = posArray[i3+2];
@@ -278,44 +282,39 @@ function animate() {
         const dxSun = sunPos.x - px;
         const dySun = sunPos.y - py;
         const dzSun = sunPos.z - pz;
-        const distSqSun = dxSun*dxSun + dySun*dySun + dzSun*dzSun + 500; // soft factor prevents infinite singularity leap
+        const distSqSun = dxSun*dxSun + dySun*dySun + dzSun*dzSun + 500;
         const distSun = Math.sqrt(distSqSun);
-        
         const forceSun = (G * currentSunMass) / distSqSun;
         const axSun = (dxSun / distSun) * forceSun;
         const aySun = (dySun / distSun) * forceSun;
         const azSun = (dzSun / distSun) * forceSun;
         
-        // ---------------- Gravitational Pull: Black Hole ----------------
+        // ---------------- Gravitational Pull: Black Hole + Spiral Vortex ----------------
         const dxBh = blackHolePos.x - px;
         const dyBh = blackHolePos.y - py;
         const dzBh = blackHolePos.z - pz;
-        const distSqBh = dxBh*dxBh + dyBh*dyBh + dzBh*dzBh + 1200; // slightly thicker soft factor for smooth slingshot
+        const distSqBh = dxBh*dxBh + dyBh*dyBh + dzBh*dzBh + 150; 
         const distBh = Math.sqrt(distSqBh);
         
         let axBh = 0, ayBh = 0, azBh = 0;
-        
         if (currentBhMass > 0) {
             const forceBh = (G * currentBhMass) / distSqBh;
             axBh = (dxBh / distBh) * forceBh;
             ayBh = (dyBh / distBh) * forceBh;
             azBh = (dzBh / distBh) * forceBh;
+            
+            // Vortex force (drag them in a circle as they fall)
+            const vortexFac = (currentBhMass / 15000.0) * Math.max(0, 1.0 - distBh / 600);
+            axBh += (-dzBh / distBh) * vortexFac * 2.0;
+            azBh += (dxBh / distBh) * vortexFac * 2.0;
         }
 
-        // --- Event Horizon Logic (Devoured by BH or Sun) ---
-        // Let particles come very close to BH so we see them get swallowed before they respawn
-        if (distBh < 5 || distSun < 40) {
-            // Respawn particle quietly at the edge of the galaxy
-            const radius = 1700 + Math.random() * 300;
-            const theta = Math.random() * Math.PI * 2;
-            posArray[i3] = Math.cos(theta) * radius;
-            posArray[i3+1] = (Math.random() - 0.5) * 10;
-            posArray[i3+2] = Math.sin(theta) * radius;
-            
-            const vOrbital = Math.sqrt(G * currentSunMass / radius);
-            velocities[i3] = -Math.sin(theta) * vOrbital * 0.9;
-            velocities[i3+1] = 0;
-            velocities[i3+2] = Math.cos(theta) * vOrbital * 0.9;
+        // --- Event Horizon: ENGOLIDAS (APAGADAS) ---
+        if (distBh < 22.0 || distSun < 38) {
+            statuses[i] = 0.0; // Mark as erased
+            posArray[i3] = 0;
+            posArray[i3+1] = 0;
+            posArray[i3+2] = 0;
             continue;
         }
 
@@ -324,7 +323,6 @@ function animate() {
         velocities[i3+1] += (aySun + ayBh);
         velocities[i3+2] += (azSun + azBh);
         
-        // Minor dust drag to keep orbits from spiralling completely unstable over hours
         velocities[i3] *= 0.9997;
         velocities[i3+1] *= 0.9997;
         velocities[i3+2] *= 0.9997;
@@ -335,6 +333,7 @@ function animate() {
     }
     
     geometry.attributes.position.needsUpdate = true;
+    geometry.attributes.particleStatus.needsUpdate = true;
     
     // Dynamic aesthetics updates
     const scale = 1.0 + Math.sin(time * 3) * 0.03;
